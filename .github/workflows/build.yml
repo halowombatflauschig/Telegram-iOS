@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [ master ]
+    branches: [ no-provisioning ]
 
   workflow_dispatch:
 
@@ -65,15 +65,30 @@ jobs:
           security set-keychain-settings "$MY_KEYCHAIN"
           security unlock-keychain -p "$MY_KEYCHAIN_PASSWORD" "$MY_KEYCHAIN"
 
-          # install certificates
-          echo $APPLE_DISTRIBUTION | base64 -di - > "dist.p12"
-          security import "dist.p12" -k "$MY_KEYCHAIN" -P "$APPLE_DISTRIBUTION_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          # install fake certificates
+          export CERTS_PATH="build-system/fake-codesigning/certs/distribution"
+          for f in "$CERTS_PATH"/*.p12; do
+            security import "$f" -k "$MY_KEYCHAIN" -P "" -T /usr/bin/codesign -T /usr/bin/security
+          done
+          # fake certificates are self-signed, so we need to manually mark them as trusted (otherwise bazel will not pick them up)
+          sudo security authorizationdb write com.apple.trust-settings.admin allow
+          for f in "$CERTS_PATH"/*.cer; do
+            sudo security add-trusted-cert -d -r trustRoot -p codeSign -k "$MY_KEYCHAIN" "$f"
+          done
           security set-key-partition-list -S apple-tool:,apple: -k "$MY_KEYCHAIN_PASSWORD" "$MY_KEYCHAIN"
 
           # use the official release configuration
           rm -rf $HOME/telegram-configuration
           mkdir -p $HOME/telegram-configuration
           cp -R telegram-configuration-dist/* $HOME/telegram-configuration/
+
+          # generate project without provisioning profiles
+          python3 build-system/Make/Make.py \
+            --bazel="$HOME/bazel-dist/bazel" \
+            --cacheDir="$HOME/telegram-bazel-cache" \
+            generateProject \
+            --configurationPath="$HOME/telegram-configuration" \
+            --disableProvisioningProfiles
 
           # build the app
           python3 build-system/Make/Make.py \
@@ -100,9 +115,6 @@ jobs:
             cp -R "$f" build/DSYMs/
           done
           zip -r "./$OUTPUT_PATH/Telegram.DSYMs.zip" build/DSYMs 1>/dev/null
-        env:
-          APPLE_DISTRIBUTION: ${{ secrets.APPLE_DISTRIBUTION }}
-          APPLE_DISTRIBUTION_PASSWORD: ${{ secrets.APPLE_DISTRIBUTION_PASSWORD }}
 
       - name: Upload IPA
         uses: actions/upload-artifact@v2
@@ -115,21 +127,3 @@ jobs:
         with:
           name: release-dsym
           path: /Users/telegram/telegram-ios/build/artifacts/Telegram.DSYMs.zip
-
-      - name: Deploy to App Store Connect
-        run: |
-          xcrun altool --upload-app --type ios \
-            --file /Users/telegram/telegram-ios/build/artifacts/Telegram.ipa \
-            --username "${{ secrets.APPSTORE_CONNECT_USERNAME }}" \
-            --password "${{ secrets.APPSTORE_CONNECT_PASSWORD }}" --verbose
-
-      - name: Upload to channel
-        env:
-          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          BOT_API_SERVER: ${{ secrets.BOT_API_SERVER }}
-        run: |
-          cd /Users/telegram/telegram-ios
-          mv /Users/telegram/telegram-ios/build/artifacts/Telegram.ipa "/Users/telegram/telegram-ios/build/artifacts/Nanogram-$APP_VERSION-$BUILD_NUMBER.ipa"
-          mv /Users/telegram/telegram-ios/build/artifacts/Telegram.DSYMs.zip "/Users/telegram/telegram-ios/build/artifacts/Nanogram-$APP_VERSION-$BUILD_NUMBER.DSYMs.zip"
-          eval $(python3 buildbox/sendMediaGroup.py)
